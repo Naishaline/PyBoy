@@ -7,11 +7,10 @@ import array
 import logging
 import os
 
+from pyboy.logger import logger
 from pyboy.utils import IntIOWrapper
 
 from .rtc import RTC
-
-from pyboy.logger import logger
 
 
 class BaseMBC:
@@ -36,6 +35,8 @@ class BaseMBC:
         self.rambank_enabled = False
         self.rambank_selected = 0
         self.rombank_selected = 1
+
+        self.is_cgb = self.getitem(0x0143) >> 7
 
         if not os.path.exists(self.filename):
             logger.info("No RAM file found. Skipping.")

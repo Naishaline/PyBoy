@@ -7,7 +7,8 @@ import logging
 
 from pyboy.utils import STATE_VERSION
 
-from . import bootrom, cartridge, cpu, interaction, lcd, ram, sound, timer
+from . import (base_ram, bootrom, cartridge, cgb_lcd, cgb_mem_manager, cgb_ram, cgb_renderer, cpu, interaction, lcd,
+               mem_manager, renderer, sound, timer)
 
 logger = logging.getLogger(__name__)
 
@@ -16,25 +17,52 @@ STAT, _, _, LY, LYC = range(0xFF41, 0xFF46)
 
 
 class Motherboard:
-    def __init__(self, gamerom_file, bootrom_file, color_palette, disable_renderer, sound_enabled, profiling=False):
+    def __init__(
+        self, gamerom_file, bootrom_file, color_palette, disable_renderer, sound_enabled, dmg, profiling=False
+    ):
         if bootrom_file is not None:
             logger.info("Boot-ROM file provided")
 
         if profiling:
             logger.info("Profiling enabled")
-
         self.timer = timer.Timer()
         self.interaction = interaction.Interaction()
         self.cartridge = cartridge.load_cartridge(gamerom_file)
-        self.bootrom = bootrom.BootROM(bootrom_file)
-        self.ram = ram.RAM(random=False)
+        self.bootrom = bootrom.BootROM(bootrom_file, dmg)
         self.cpu = cpu.CPU(self, profiling)
-        self.lcd = lcd.LCD()
-        self.renderer = lcd.Renderer(color_palette)
-        self.disable_renderer = disable_renderer
+
         self.sound_enabled = sound_enabled
-        if sound_enabled:
-            self.sound = sound.Sound()
+        self.sound = sound.Sound()
+
+        self.is_cgb = not dmg
+
+        if dmg:
+            logger.info("Started as Game Boy")
+            self.renderer = renderer.Renderer(color_palette)
+            self.lcd = lcd.LCD(self.renderer)
+            self.ram = base_ram.RAM(random=False)
+            self.mem_manager = mem_manager.MemoryManager(
+                self, self.bootrom, self.cartridge, self.lcd, self.timer, self.sound, self.ram, self.renderer
+            )
+        else:
+            logger.info("Started as Game Boy Color")
+            if self.cartridge.is_cgb:
+                self.renderer = cgb_renderer.CGBRenderer()
+            else:
+                # Running DMG ROM on CGB hardware
+                # use the default palettes
+                bg_pal = (0xFFFFFF, 0x7BFF31, 0x0063C5, 0x000000)
+                obj0_pal = (0xFFFFFF, 0xFF8484, 0xFF8484, 0x000000)
+                obj1_pal = (0xFFFFFF, 0xFF8484, 0xFF8484, 0x000000)
+                self.renderer = renderer.Renderer(bg_pal, obj0_pal, obj1_pal)
+            self.lcd = cgb_lcd.cgbLCD(self.renderer)
+            self.ram = cgb_ram.CgbRam(random=False)
+            self.mem_manager = cgb_mem_manager.CgbMemoryManager(
+                self, self.bootrom, self.cartridge, self.lcd, self.timer, self.sound, self.ram, self.renderer
+            )
+
+        self.disable_renderer = disable_renderer
+
         self.bootrom_enabled = True
         self.serialbuffer = ""
         self.cycles_remaining = 0
@@ -114,6 +142,7 @@ class Motherboard:
 
     # TODO: Move out of MB
     def check_LYC(self, y):
+        #print("%s" % format(self.getitem(STAT), '#010b'))
         self.setitem(LY, y)
         if self.getitem(LYC) == y:
             self.setitem(STAT, self.getitem(STAT) | 0b100) # Sets the LYC flag
@@ -124,6 +153,15 @@ class Motherboard:
 
     def calculate_cycles(self, cycles_period):
         self.cycles_remaining += cycles_period
+
+        # TODO: Temporary hdma transfer
+        if self.is_cgb:
+            mode = self.getitem(STAT) & 0b11
+            if mode == 0:
+                self.mem_manager.do_potential_transfer()
+                self.cycles_remaining -= 8 # TODO: adjust for double speed
+        ##############################
+
         while self.cycles_remaining > 0:
             cycles = self.cpu.tick()
 
@@ -153,26 +191,39 @@ class Motherboard:
     def tickframe(self):
         lcdenabled = self.lcd.LCDC.lcd_enable
         if lcdenabled:
+
             # TODO: the 19, 41 and 49._ticks should correct for longer instructions
             # Iterate the 144 lines on screen
             for y in range(144):
                 self.check_LYC(y)
 
+                mode0_dots = 206
+                mode1_dots = 456
+                mode2_dots = 80
+                mode3_dots = 170
+
+                if self.is_cgb:
+                    if self.mem_manager.is_double_speed:
+                        mode0_dots *= 2
+                        mode1_dots *= 2
+                        mode2_dots *= 2
+                        mode3_dots *= 2
+
                 # Mode 2
                 # TODO: Move out of MB
                 self.set_STAT_mode(2)
-                self.calculate_cycles(80)
+                self.calculate_cycles(mode2_dots)
 
                 # Mode 3
                 # TODO: Move out of MB
                 self.set_STAT_mode(3)
-                self.calculate_cycles(170)
+                self.calculate_cycles(mode3_dots)
                 self.renderer.scanline(y, self.lcd)
 
                 # Mode 0
                 # TODO: Move out of MB
                 self.set_STAT_mode(0)
-                self.calculate_cycles(206)
+                self.calculate_cycles(mode0_dots)
 
             self.cpu.set_interruptflag(VBLANK)
             if not self.disable_renderer:
@@ -184,7 +235,7 @@ class Motherboard:
 
                 # Mode 1
                 self.set_STAT_mode(1)
-                self.calculate_cycles(456)
+                self.calculate_cycles(mode1_dots)
         else:
             # https://www.reddit.com/r/EmuDev/comments/6r6gf3
             # TODO: What happens if LCD gets turned on/off mid-cycle?
@@ -202,146 +253,7 @@ class Motherboard:
     # MemoryManager
     #
     def getitem(self, i):
-        if 0x0000 <= i < 0x4000: # 16kB ROM bank #0
-            if i <= 0xFF and self.bootrom_enabled:
-                return self.bootrom.getitem(i)
-            else:
-                return self.cartridge.getitem(i)
-        elif 0x4000 <= i < 0x8000: # 16kB switchable ROM bank
-            return self.cartridge.getitem(i)
-        elif 0x8000 <= i < 0xA000: # 8kB Video RAM
-            return self.lcd.VRAM[i - 0x8000]
-        elif 0xA000 <= i < 0xC000: # 8kB switchable RAM bank
-            return self.cartridge.getitem(i)
-        elif 0xC000 <= i < 0xE000: # 8kB Internal RAM
-            return self.ram.internal_ram0[i - 0xC000]
-        elif 0xE000 <= i < 0xFE00: # Echo of 8kB Internal RAM
-            # Redirect to internal RAM
-            return self.getitem(i - 0x2000)
-        elif 0xFE00 <= i < 0xFEA0: # Sprite Attribute Memory (OAM)
-            return self.lcd.OAM[i - 0xFE00]
-        elif 0xFEA0 <= i < 0xFF00: # Empty but unusable for I/O
-            return self.ram.non_io_internal_ram0[i - 0xFEA0]
-        elif 0xFF00 <= i < 0xFF4C: # I/O ports
-            if i == 0xFF04:
-                return self.timer.DIV
-            elif i == 0xFF05:
-                return self.timer.TIMA
-            elif i == 0xFF06:
-                return self.timer.TMA
-            elif i == 0xFF07:
-                return self.timer.TAC
-            elif 0xFF10 <= i < 0xFF40:
-                if self.sound_enabled:
-                    return self.sound.get(i - 0xFF10)
-                else:
-                    return 0
-            elif i == 0xFF40:
-                return self.lcd.LCDC.value
-            elif i == 0xFF42:
-                return self.lcd.SCY
-            elif i == 0xFF43:
-                return self.lcd.SCX
-            elif i == 0xFF47:
-                return self.lcd.BGP.value
-            elif i == 0xFF48:
-                return self.lcd.OBP0.value
-            elif i == 0xFF49:
-                return self.lcd.OBP1.value
-            elif i == 0xFF4A:
-                return self.lcd.WY
-            elif i == 0xFF4B:
-                return self.lcd.WX
-            else:
-                return self.ram.io_ports[i - 0xFF00]
-        elif 0xFF4C <= i < 0xFF80: # Empty but unusable for I/O
-            return self.ram.non_io_internal_ram1[i - 0xFF4C]
-        elif 0xFF80 <= i < 0xFFFF: # Internal RAM
-            return self.ram.internal_ram1[i - 0xFF80]
-        elif i == 0xFFFF: # Interrupt Enable Register
-            return self.ram.interrupt_register[0]
-        else:
-            raise IndexError("Memory access violation. Tried to read: %s" % hex(i))
+        return self.mem_manager.getitem(i)
 
     def setitem(self, i, value):
-        assert 0 <= value < 0x100, "Memory write error! Can't write %s to %s" % (hex(value), hex(i))
-
-        if 0x0000 <= i < 0x4000: # 16kB ROM bank #0
-            # Doesn't change the data. This is for MBC commands
-            self.cartridge.setitem(i, value)
-        elif 0x4000 <= i < 0x8000: # 16kB switchable ROM bank
-            # Doesn't change the data. This is for MBC commands
-            self.cartridge.setitem(i, value)
-        elif 0x8000 <= i < 0xA000: # 8kB Video RAM
-            self.lcd.VRAM[i - 0x8000] = value
-            if i < 0x9800: # Is within tile data -- not tile maps
-                # Mask out the byte of the tile
-                self.renderer.tiles_changed.add(i & 0xFFF0)
-        elif 0xA000 <= i < 0xC000: # 8kB switchable RAM bank
-            self.cartridge.setitem(i, value)
-        elif 0xC000 <= i < 0xE000: # 8kB Internal RAM
-            self.ram.internal_ram0[i - 0xC000] = value
-        elif 0xE000 <= i < 0xFE00: # Echo of 8kB Internal RAM
-            self.setitem(i - 0x2000, value) # Redirect to internal RAM
-        elif 0xFE00 <= i < 0xFEA0: # Sprite Attribute Memory (OAM)
-            self.lcd.OAM[i - 0xFE00] = value
-        elif 0xFEA0 <= i < 0xFF00: # Empty but unusable for I/O
-            self.ram.non_io_internal_ram0[i - 0xFEA0] = value
-        elif 0xFF00 <= i < 0xFF4C: # I/O ports
-            if i == 0xFF00:
-                self.ram.io_ports[i - 0xFF00] = self.interaction.pull(value)
-            elif i == 0xFF01:
-                self.serialbuffer += chr(value)
-                self.ram.io_ports[i - 0xFF00] = value
-            elif i == 0xFF04:
-                self.timer.DIV = 0
-            elif i == 0xFF05:
-                self.timer.TIMA = value
-            elif i == 0xFF06:
-                self.timer.TMA = value
-            elif i == 0xFF07:
-                self.timer.TAC = value & 0b111
-            elif 0xFF10 <= i < 0xFF40:
-                if self.sound_enabled:
-                    self.sound.set(i - 0xFF10, value)
-            elif i == 0xFF40:
-                self.lcd.LCDC.set(value)
-            elif i == 0xFF42:
-                self.lcd.SCY = value
-            elif i == 0xFF43:
-                self.lcd.SCX = value
-            elif i == 0xFF46:
-                self.transfer_DMA(value)
-            elif i == 0xFF47:
-                # TODO: Move out of MB
-                self.renderer.clearcache |= self.lcd.BGP.set(value)
-            elif i == 0xFF48:
-                # TODO: Move out of MB
-                self.renderer.clearcache |= self.lcd.OBP0.set(value)
-            elif i == 0xFF49:
-                # TODO: Move out of MB
-                self.renderer.clearcache |= self.lcd.OBP1.set(value)
-            elif i == 0xFF4A:
-                self.lcd.WY = value
-            elif i == 0xFF4B:
-                self.lcd.WX = value
-            else:
-                self.ram.io_ports[i - 0xFF00] = value
-        elif 0xFF4C <= i < 0xFF80: # Empty but unusable for I/O
-            if self.bootrom_enabled and i == 0xFF50 and value == 0x1 or value == 0x11: #0x11 for gameboy color
-                self.bootrom_enabled = False
-            self.ram.non_io_internal_ram1[i - 0xFF4C] = value
-        elif 0xFF80 <= i < 0xFFFF: # Internal RAM
-            self.ram.internal_ram1[i - 0xFF80] = value
-        elif i == 0xFFFF: # Interrupt Enable Register
-            self.ram.interrupt_register[0] = value
-        else:
-            raise Exception("Memory access violation. Tried to write: %s" % hex(i))
-
-    def transfer_DMA(self, src):
-        # http://problemkaputt.de/pandocs.htm#lcdoamdmatransfers
-        # TODO: Add timing delay of 160µs and disallow access to RAM!
-        dst = 0xFE00
-        offset = src * 0x100
-        for n in range(0xA0):
-            self.setitem(dst + n, self.getitem(n + offset))
+        self.mem_manager.setitem(i, value)

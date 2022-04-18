@@ -8,10 +8,9 @@ import argparse
 import os
 
 from pyboy import PyBoy, core
-from pyboy.logger import log_level
+from pyboy.logger import log_level, logger
 from pyboy.plugins.manager import parser_arguments
 from pyboy.pyboy import defaults
-from pyboy.logger import logger
 
 INTERNAL_LOADSTATE = "INTERNAL_LOADSTATE_TOKEN"
 
@@ -73,6 +72,11 @@ parser.add_argument(
 parser.add_argument("-s", "--scale", default=defaults["scale"], type=int, help="The scaling multiplier for the window")
 parser.add_argument("--disable-renderer", action="store_true", help="Disables screen rendering for higher performance")
 parser.add_argument("--sound", action="store_true", help="Enable sound (beta)")
+parser.add_argument("--dmg", action="store_true", help="run emulator as DMG")
+
+gameboy_type_parser = parser.add_mutually_exclusive_group()
+gameboy_type_parser.add_argument("--dmg", action="store_true", help="Force emulator to run as original Game Boy (DMG)")
+gameboy_type_parser.add_argument("--cgb", action="store_true", help="Force emulator to run as Game Boy Color")
 
 for arguments in parser_arguments():
     for a in arguments:
