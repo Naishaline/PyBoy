@@ -119,6 +119,7 @@ main:
     ; ###############################
     ; Recreate state of DMG boot ROM
     ; ###############################
+
     ld B, 6
     ld HL, .sec0
     ld DE, $FF0F
@@ -141,7 +142,7 @@ main:
     ; call .memcpy
 
     ; TODO: Restore register values?
-    jp .end
+    jp end
 
 .memcpy
     ; Regular memcpy. HL is source, DE is target, B is length
@@ -174,6 +175,7 @@ main:
 INCLUDE "logo.asm"
 
 SECTION "epilog", ROM0[$00FC]
-.end
-    ld A, $01
+end:
+    ld A, $1
     ld [$FF00+$50], A
+
